@@ -5,19 +5,21 @@ import { fileURLToPath } from "url";
 import cors from "cors";
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
-import fs from "fs";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Ensure uploads directory exists
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
-}
+// ── AWS Clients (uses EC2 instance role automatically – no keys needed) ──
+const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
 
-// Memory-based database (Placeholder for RDS/DynamoDB)
-// In a real AWS scenario, this would be a DynamoDB table or RDS database.
+const dynamo = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" })
+);
+
+// ── Profile type ──
 interface Profile {
   id: string;
   name: string;
@@ -27,42 +29,67 @@ interface Profile {
   createdAt: string;
 }
 
-let profiles: Profile[] = [];
+// ── Upload to S3 ──
+async function uploadToS3(file: Express.Multer.File): Promise<string> {
+  const ext = path.extname(file.originalname);
+  const key = `uploads/${uuidv4()}${ext}`;
 
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME!,
+      Key: key,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    })
+  );
+
+  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+}
+
+// ── Save profile to DynamoDB ──
+async function saveProfile(profile: Profile): Promise<void> {
+  await dynamo.send(
+    new PutCommand({
+      TableName: process.env.DYNAMODB_TABLE || "UserUploads",
+      Item: profile,
+    })
+  );
+}
+
+// ── Get all profiles from DynamoDB ──
+async function getAllProfiles(): Promise<Profile[]> {
+  const result = await dynamo.send(
+    new ScanCommand({
+      TableName: process.env.DYNAMODB_TABLE || "UserUploads",
+    })
+  );
+  return (result.Items as Profile[]) || [];
+}
+
+// ── Express server ──
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || "3000");
 
   app.use(cors());
   app.use(express.json());
 
-  // Static folder for uploads
-  // AWS S3 Tip: In production, you would serve these from an S3 bucket URL.
-  app.use("/uploads", express.static(uploadDir));
-
-  // --- API Routes ---
+  // multer uses memory storage – file goes straight to S3, not to disk
+  const upload = multer({ storage: multer.memoryStorage() });
 
   // GET all profiles
-  app.get("/api/profiles", (req, res) => {
-    res.json(profiles);
+  app.get("/api/profiles", async (req, res) => {
+    try {
+      const profiles = await getAllProfiles();
+      res.json(profiles);
+    } catch (error) {
+      console.error("Error fetching profiles:", error);
+      res.status(500).json({ error: "Failed to fetch profiles" });
+    }
   });
 
-  // POST create profile
-  // AWS Tip: This is where you would use IAM roles to grant permission
-  // for your EC2 instance to write to DynamoDB and upload to S3.
-  const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-      cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname);
-      cb(null, `${uuidv4()}${ext}`);
-    },
-  });
-
-  const upload = multer({ storage });
-
-  app.post("/api/profiles", upload.single("image"), (req, res) => {
+  // POST create profile → upload image to S3 → save metadata to DynamoDB
+  app.post("/api/profiles", upload.single("image"), async (req, res) => {
     try {
       const { name, age, position } = req.body;
       const file = req.file;
@@ -71,16 +98,22 @@ async function startServer() {
         return res.status(400).json({ error: "Image is required" });
       }
 
+      // 1. Upload image to S3
+      const imageUrl = await uploadToS3(file);
+
+      // 2. Build profile object
       const newProfile: Profile = {
         id: uuidv4(),
         name,
         age: parseInt(age),
         position,
-        imageUrl: `/uploads/${file.filename}`, // Using relative URL for now
+        imageUrl,  // S3 public URL
         createdAt: new Date().toISOString(),
       };
 
-      profiles.push(newProfile);
+      // 3. Save to DynamoDB
+      await saveProfile(newProfile);
+
       res.status(201).json(newProfile);
     } catch (error) {
       console.error("Error creating profile:", error);
@@ -88,7 +121,7 @@ async function startServer() {
     }
   });
 
-  // --- Vite Middleware ---
+  // ── Vite Middleware ──
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -105,7 +138,6 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Development mode: ${process.env.NODE_ENV !== "production"}`);
   });
 }
 
